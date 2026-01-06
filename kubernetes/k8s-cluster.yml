@@ -1,0 +1,159 @@
+---
+- name: Prepare all Kubernetes nodes
+  hosts: k8s
+  become: true
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Populate /etc/hosts with cluster nodes
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+        state: present
+      loop: "{{ groups['k8s'] }}"
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Comment swap in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Ensure kernel modules loaded
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Apply sysctl settings
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Reload sysctl
+      command: sysctl --system
+
+    - name: Install container runtime deps
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - containerd
+        state: present
+        update_cache: yes
+
+    - name: Generate containerd config
+      command: containerd config default
+      register: containerd_config
+      changed_when: false
+
+    - name: Write containerd config
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config.stdout }}"
+
+    - name: Enable systemd cgroups
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      when: containerd_systemd_cgroup
+
+    - name: Enable and restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+
+    - name: Add Kubernetes apt key
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key \
+        | gpg --dearmor -o /etc/apt/keyrings/k8s.gpg
+      args:
+        creates: /etc/apt/keyrings/k8s.gpg
+
+    - name: Add Kubernetes apt repo
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/k8s.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+- name: Bootstrap control plane
+  hosts: "{{ groups['k8s'][0] }}"
+  become: true
+  tasks:
+    - name: Initialize Kubernetes control plane
+      command: >
+        kubeadm init
+        --apiserver-advertise-address={{ ansible_host }}
+        --control-plane-endpoint={{ inventory_hostname }}
+        --pod-network-cidr={{ pod_network_cidr }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+
+    - name: Configure kubectl for root
+      command: >
+        mkdir -p /root/.kube &&
+        cp /etc/kubernetes/admin.conf /root/.kube/config
+
+    - name: Install CNI plugin
+      command: kubectl apply -f {{ cni_manifest_url }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Set join command fact
+      set_fact:
+        kube_join_command: "{{ join_cmd.stdout }}"
+
+- name: Join worker nodes
+  hosts: "{{ groups['k8s'][1:] }}"
+  become: true
+  tasks:
+    - name: Join cluster
+      command: "{{ hostvars[groups['k8s'][0]].kube_join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf

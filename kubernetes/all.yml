@@ -1,0 +1,5 @@
+kubernetes_version: "1.31"
+pod_network_cidr: "10.244.0.0/16"
+cni_manifest_url: "https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml"
+
+containerd_systemd_cgroup: true
