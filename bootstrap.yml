@@ -1,0 +1,129 @@
+---
+# bootstrap.yml
+#
+# Run this against new hosts to prepare them for Ansible management.
+# You will need to enforce this running as a local user, as ansible service account won't exist yet until after this play
+#
+# Example:
+# ansible-playbook -i inventory/dynamic_inventory.py playbooks/bootstrap.yml -e ansible_user=<local user> -k -b -K
+#
+
+- name: Prepare local controller
+  hosts: localhost
+  become: yes
+  vars:
+    ansible_user_name: ansible
+    ansible_group_name: ansible-admins
+    ansible_home: "/home/{{ ansible_user_name }}"
+
+  tasks:
+    - name: Ensure ansible-admin group exists locally
+      group:
+        name: "{{ ansible_group_name }}"
+        state: present
+
+    - name: Ensure ansible user exists locally
+      user:
+        name: "{{ ansible_user_name }}"
+        group: "{{ ansible_group_name }}"
+        create_home: yes
+        shell: /bin/bash
+
+    - name: Ensure local .ssh directory exists
+      file:
+        path: "{{ ansible_home }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_group_name }}"
+        mode: '0700'
+
+    - name: Check if SSH private key exists
+      stat:
+        path: "{{ ansible_home }}/.ssh/id_rsa"
+      register: ssh_private_key
+
+    - name: Check if SSH public key exists
+      stat:
+        path: "{{ ansible_home }}/.ssh/id_rsa.pub"
+      register: ssh_public_key
+
+    - name: Read local ansible public key
+      slurp:
+        src: "{{ ansible_home }}/.ssh/id_rsa.pub"
+      register: ansible_pubkey_raw
+
+    - set_fact:
+        ansible_pubkey: "{{ ansible_pubkey_raw.content | b64decode }}"
+
+
+- name: Bootstrap remote hosts for Ansible usage
+  hosts: bootstrap
+  become: yes
+  gather_facts: false
+  vars:
+    ansible_user_name: ansible
+    ansible_group_name: ansible-admin
+    ansible_pubkey: "{{ hostvars['127.0.0.1'].ansible_pubkey }}"
+
+  tasks:
+    - name: Install python3 (required for further modules)
+      raw: |
+        apt-get update -y && apt-get install -y python3
+      changed_when: false
+
+    - name: Install useful packages
+      apt:
+        name:
+          - sudo
+          - zsh
+        state: present
+        update_cache: yes
+
+    - name: Ensure ansible-admin group exists
+      group:
+        name: "{{ ansible_group_name }}"
+        state: present
+
+    - name: Ensure ansible user exists
+      user:
+        name: "{{ ansible_user_name }}"
+        group: "{{ ansible_group_name }}"
+        shell: /usr/bin/bash
+        create_home: yes
+
+    - name: Create remote .ssh directory
+      file:
+        path: "/home/{{ ansible_user_name }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_group_name }}"
+        mode: '0700'
+
+    - name: Install ansible user public key
+      copy:
+        content: "{{ ansible_pubkey }}"
+        dest: "/home/{{ ansible_user_name }}/.ssh/authorized_keys"
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_group_name }}"
+        mode: '0600'
+
+    - name: Allow passwordless sudo
+      copy:
+        dest: "/etc/sudoers.d/{{ ansible_user_name }}"
+        content: "{{ ansible_user_name }} ALL=(ALL) NOPASSWD:ALL"
+        owner: root
+        group: root
+        mode: '0440'
+
+    - name: Disable SSH password authentication (optional)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^PasswordAuthentication"
+        line: "PasswordAuthentication no"
+      notify: Restart SSH
+
+  handlers:
+    - name: Restart SSH
+      service:
+        name: ssh
+        state: restarted

@@ -1,0 +1,93 @@
+---
+- name: Deploy Gitea on target hosts
+  hosts: gitea
+  become: yes
+
+  vars:
+    gitea_version: "1.22.3"
+    gitea_user: "gitea"
+    gitea_home: "/home/gitea"
+    gitea_bin_path: "/usr/local/bin/gitea"
+    gitea_root: "/var/lib/gitea"
+    gitea_custom: "/var/lib/gitea/custom"
+    gitea_conf_dir: "/etc/gitea"
+    gitea_service: "/etc/systemd/system/gitea.service"
+
+  tasks:
+
+    - name: Ensure gitea user exists
+      user:
+        name: "{{ gitea_user }}"
+        home: "{{ gitea_home }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - wget
+          - sqlite3
+          - ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Create Gitea required directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ gitea_user }}"
+        group: "{{ gitea_user }}"
+        mode: '0755'
+      loop:
+        - "{{ gitea_root }}"
+        - "{{ gitea_custom }}"
+        - "{{ gitea_conf_dir }}"
+
+    - name: Download Gitea binary
+      get_url:
+        url: "https://dl.gitea.io/gitea/{{ gitea_version }}/gitea-{{ gitea_version }}-linux-amd64"
+        dest: "{{ gitea_bin_path }}"
+        mode: '0755'
+      register: gitea_download
+
+    - name: Ensure correct permissions on Gitea binary
+      file:
+        path: "{{ gitea_bin_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy systemd service
+      copy:
+        dest: "{{ gitea_service }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Gitea
+          After=network.target
+
+          [Service]
+          RestartSec=2s
+          Type=simple
+          User={{ gitea_user }}
+          Group={{ gitea_user }}
+          WorkingDirectory={{ gitea_root }}
+          ExecStart={{ gitea_bin_path }} web --config {{ gitea_conf_dir }}/app.ini
+          Restart=always
+          Environment=USER={{ gitea_user }} HOME={{ gitea_home }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd units
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Gitea
+      systemd:
+        name: gitea
+        enabled: yes
+        state: started

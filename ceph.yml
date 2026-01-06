@@ -1,0 +1,323 @@
+---
+- name: Deploy Ceph Cluster (cephadm, Ubuntu repo, auto-bootstrap)
+  hosts: ceph
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # primary variables
+    ceph_release: quincy
+    cephadm_bin: /usr/sbin/cephadm
+
+    # service account to use for cephadm orchestration (you said you created "ceph")
+    ceph_user: ceph
+
+    # bootstrap selection
+    bootstrap_host: "{{ groups['ceph'][0] }}"
+    bootstrap_ip: "{{ hostvars[bootstrap_host].ansible_default_ipv4.address }}"
+
+    # networks
+    ceph_public_network: "192.168.9.0/24"
+    ceph_cluster_network: "10.0.0.0/24"
+
+    # OSD options
+    ceph_osd_auto_devices: true
+    ceph_osd_devices: []
+
+    # path for the cephadm private key that the orchestrator will use (created on bootstrap)
+    cephadm_ssh_key: /var/lib/ceph/cephadm/cephadm.id_rsa
+    cephadm_ssh_pub: "{{ cephadm_ssh_key }}.pub"
+
+  tasks:
+    #######################################################################
+    # 1. Install dependencies + Ceph packages from Ubuntu repo
+    #######################################################################
+
+    - name: Ensure apt prerequisites
+      apt:
+        name:
+          - curl
+          - lvm2
+          - chrony
+          - python3
+          - python3-apt
+        state: present
+        update_cache: yes
+
+    - name: Install cephadm from Ubuntu repo
+      apt:
+        name: cephadm
+        state: present
+      register: cephadm_pkg
+
+    - name: Confirm cephadm installed in /usr/sbin
+      stat:
+        path: "{{ cephadm_bin }}"
+      register: cephadm_stat
+
+    - name: Fail if cephadm binary missing
+      fail:
+        msg: "cephadm was not installed at {{ cephadm_bin }}"
+      when: not cephadm_stat.stat.exists
+
+    #######################################################################
+    # 2. Ensure ceph service account exists everywhere and has sudo
+    #######################################################################
+
+    - name: Ensure ceph service account exists
+      user:
+        name: "{{ ceph_user }}"
+        shell: /bin/bash
+        create_home: yes
+        groups: sudo
+        state: present
+
+    - name: Ensure ceph user .ssh directory exists
+      file:
+        path: "/home/{{ ceph_user }}/.ssh"
+        state: directory
+        owner: "{{ ceph_user }}"
+        group: "{{ ceph_user }}"
+        mode: '0700'
+
+    - name: Ensure ceph has passwordless sudo
+      copy:
+        dest: "/etc/sudoers.d/{{ ceph_user }}"
+        content: "{{ ceph_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: '0440'
+
+    #######################################################################
+    # 2b. Create cephadm keypair on bootstrap host and distribute pubkey
+    # (we create the private key on the bootstrap node and copy the public
+    #  to the ceph user's authorized_keys on all hosts)
+    #######################################################################
+
+    - name: Ensure cephadm key directory exists on bootstrap
+      file:
+        path: /var/lib/ceph/cephadm
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      delegate_to: "{{ bootstrap_host }}"
+
+    - name: Generate cephadm SSH keypair on bootstrap if missing
+      command: ssh-keygen -t rsa -b 4096 -N '' -f "{{ cephadm_ssh_key }}"
+      args:
+        creates: "{{ cephadm_ssh_key }}"
+      register: cephadm_keygen
+      changed_when: cephadm_keygen.rc == 0
+      delegate_to: "{{ bootstrap_host }}"
+
+    - name: Read cephadm public key from bootstrap
+      slurp:
+        src: "{{ cephadm_ssh_pub }}"
+      register: cephadm_pubkey_raw
+      delegate_to: "{{ bootstrap_host }}"
+
+    - name: Set cephadm_pubkey fact (decoded)
+      set_fact:
+        cephadm_pubkey: "{{ cephadm_pubkey_raw.content | b64decode }}"
+
+    - name: Distribute cephadm public key to ceph user's authorized_keys on all hosts
+      authorized_key:
+        user: "{{ ceph_user }}"
+        key: "{{ cephadm_pubkey }}"
+        state: present
+
+    #######################################################################
+    # 3. Bootstrap - only run on bootstrap host
+    #######################################################################
+
+    - name: Bootstrap block (run only on bootstrap host)
+      block:
+
+        # cleanup stage
+        - name: Check if /etc/ceph/ceph.conf exists
+          stat:
+            path: /etc/ceph/ceph.conf
+          register: ceph_conf_stat
+          changed_when: false
+
+        - name: Slurp /etc/ceph/ceph.conf if present
+          slurp:
+            src: /etc/ceph/ceph.conf
+          register: ceph_conf_raw
+          when: ceph_conf_stat.stat.exists
+          changed_when: false
+
+        - name: Extract FSID from ceph.conf (if present)
+          set_fact:
+            ceph_fsid: >-
+              {{ (ceph_conf_raw.content | b64decode)
+                 | regex_search('fsid\\s*=\\s*([0-9a-fA-F\\-]+)', '\\1')
+                 | default('') }}
+          when: ceph_conf_stat.stat.exists
+
+        - name: Debug FSID (diagnostic)
+          debug:
+            msg: "Found FSID='{{ ceph_fsid | default('[none]') }}'"
+          changed_when: false
+
+        - name: Try rm-cluster with FSID (if found)
+          shell: "{{ cephadm_bin }} rm-cluster --force --zap-osds --fsid {{ ceph_fsid }}"
+          when: ceph_fsid | length > 0
+          ignore_errors: yes
+          register: rmcluster_result
+
+        - name: Remove stale Ceph directories (if rm-cluster not executed or failed)
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/ceph
+            - /var/lib/ceph
+            - /var/run/ceph
+          when: ceph_fsid | length == 0 or (rmcluster_result.rc | default(1)) != 0
+          ignore_errors: yes
+
+        - name: Recreate minimal /var/lib/ceph
+          file:
+            path: /var/lib/ceph
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        # create minimal config file for bootstrap networks
+        - name: Create bootstrap ceph.conf with networks
+          copy:
+            dest: /tmp/ceph.bootstrap.conf
+            mode: '0644'
+            content: |
+              [global]
+                public_network = {{ ceph_public_network }}
+                cluster_network = {{ ceph_cluster_network }}
+
+        - name: Bootstrap Ceph cluster
+          command: >
+            {{ cephadm_bin }} bootstrap
+            --mon-ip {{ bootstrap_ip }}
+            --initial-dashboard-user admin
+            --initial-dashboard-password admin
+            --config /tmp/ceph.bootstrap.conf
+            --allow-overwrite
+            --cleanup-on-failure
+          args:
+            creates: /var/lib/ceph/bootstrap-created
+          register: bootstrap_out
+
+        - name: Mark bootstrap completion
+          file:
+            path: /var/lib/ceph/bootstrap-created
+            state: touch
+
+        # Ensure the cephadm orchestrator backend is enabled, and the orchestrator
+        # is configured to use the ceph user before we add other hosts
+        - name: Ensure /etc/ceph/cephadm.conf contains ssh_user setting
+          copy:
+            dest: /etc/ceph/cephadm.conf
+            content: |
+              [cephadm]
+              ssh_user = {{ ceph_user }}
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Enable cephadm orchestrator backend
+          command: "{{ cephadm_bin }} shell -- ceph orch set backend cephadm"
+          register: backend_enable
+          retries: 5
+          delay: 4
+          until: backend_enable.rc == 0
+
+        - name: Pause briefly after enabling orchestrator backend
+          pause:
+            seconds: 4
+
+        - name: Configure cephadm orchestrator to use non-root user (ceph)
+          command: "{{ cephadm_bin }} shell -- ceph cephadm set-user {{ ceph_user }}"
+          register: set_user_out
+          retries: 8
+          delay: 4
+          until: set_user_out.rc == 0
+
+        - name: Wait for MON/Manager API
+          wait_for:
+            host: "{{ bootstrap_ip }}"
+            port: 3300
+            delay: 2
+            timeout: 180
+          ignore_errors: yes
+
+        # Verify cephadm can SSH as the ceph user to each host (delegate from bootstrap)
+        - name: Verify ceph SSH access from bootstrap to every host (skip bootstrap itself)
+          vars:
+            target: "{{ item }}"
+          shell: >
+            ssh -i {{ cephadm_ssh_key }} -o BatchMode=yes -o ConnectTimeout=8
+            -o StrictHostKeyChecking=no {{ ceph_user }}@{{ item }} 'sudo -n whoami'
+          register: ceph_ssh_test
+          loop: "{{ groups['ceph'] }}"
+          when: item != bootstrap_host
+          retries: 6
+          delay: 4
+          until: ceph_ssh_test.rc == 0
+          delegate_to: "{{ bootstrap_host }}"
+
+        - name: Debug ceph ssh test results
+          debug:
+            var: ceph_ssh_test.results
+          when: ceph_ssh_test is defined
+          delegate_to: "{{ bootstrap_host }}"
+
+      when: inventory_hostname == bootstrap_host
+
+    #######################################################################
+    # 4. Add remaining hosts to the Ceph orchestrator
+    #######################################################################
+
+    - name: Add this host to Ceph orchestrator (non-bootstrap)
+      when: inventory_hostname != bootstrap_host
+      block:
+        - name: Add host into Ceph orchestrator
+          command: >
+            {{ cephadm_bin }} shell -- ceph orch host add
+            {{ inventory_hostname }} {{ ansible_default_ipv4.address }}
+          delegate_to: "{{ bootstrap_host }}"
+          register: host_add
+          failed_when: host_add.rc not in [0,1]
+          changed_when: "'already' not in host_add.stdout"
+
+    #######################################################################
+    # 5. Deploy MON, MGR services (bootstrap only)
+    #######################################################################
+
+    - name: Deploy MON and MGR (bootstrap only)
+      when: inventory_hostname == bootstrap_host
+      block:
+        - name: Apply MONs
+          command: "{{ cephadm_bin }} shell -- ceph orch apply mon --placement=all"
+          delegate_to: "{{ bootstrap_host }}"
+
+        - name: Apply MGRs
+          command: "{{ cephadm_bin }} shell -- ceph orch apply mgr --placement=all"
+          delegate_to: "{{ bootstrap_host }}"
+
+    #######################################################################
+    # 6. Deploy OSDs (bootstrap only)
+    #######################################################################
+
+    - name: Deploy OSDs using all available devices
+      when: inventory_hostname == bootstrap_host and ceph_osd_auto_devices
+      command: "{{ cephadm_bin }} shell -- ceph orch apply osd --all-available-devices"
+      delegate_to: "{{ bootstrap_host }}"
+
+    - name: Deploy OSDs using explicit device list
+      when: inventory_hostname == bootstrap_host and (ceph_osd_devices | length) > 0
+      command: >
+        {{ cephadm_bin }} shell -- ceph orch apply osd
+        --devices {{ ceph_osd_devices | join(',') }}
+      delegate_to: "{{ bootstrap_host }}"

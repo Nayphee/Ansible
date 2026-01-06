@@ -1,0 +1,40 @@
+hosts:
+
+  #- name: localhost
+  #  ip: 127.0.0.1
+  #  env: PRD
+  #  ansible_user: ansible
+  #  roles: []
+  #  local: true
+
+  - name: admin
+    ip: 192.168.9.130
+    env: PRD
+    ansible_user: ansible
+    local: true
+    roles:
+      - gitea
+
+  - name: ceph1
+    ip: 192.168.9.136
+    env: PRD
+    ansible_user: ansible
+    roles:
+      - bootstrap
+      - ceph
+
+  - name: ceph2
+    ip: 192.168.9.137
+    env: PRD
+    ansible_user: ansible
+    roles:
+      - bootstrap
+      - ceph
+
+  - name: ceph3
+    ip: 192.168.9.138
+    env: PRD
+    ansible_user: ansible
+    roles:
+      - bootstrap
+      - ceph
